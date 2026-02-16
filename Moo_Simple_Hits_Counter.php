@@ -103,13 +103,82 @@ function moo_plugin_data_migration(){
     }
 }
 
+function moo_get_selected_custom_post_types() {
+    $selected = get_option('moo_shc_tracked_post_types', array());
+    if (!is_array($selected)) {
+        return array();
+    }
+
+    return array_map('sanitize_key', $selected);
+}
+
+function moo_get_selected_taxonomies() {
+    $selected = get_option('moo_shc_tracked_taxonomies', array());
+    if (!is_array($selected)) {
+        return array();
+    }
+
+    return array_map('sanitize_key', $selected);
+}
+
+function moo_get_tracking_context() {
+    if (is_admin()) {
+        return false;
+    }
+
+    if (is_singular()) {
+        $object_id = get_queried_object_id();
+        $post_type = get_post_type($object_id);
+
+        if (!$object_id || !$post_type) {
+            return false;
+        }
+
+        if (in_array($post_type, array('post', 'page'), true)) {
+            return array(
+                'id' => $object_id,
+                'type' => $post_type,
+            );
+        }
+
+        if (in_array($post_type, moo_get_selected_custom_post_types(), true)) {
+            return array(
+                'id' => $object_id,
+                'type' => $post_type,
+            );
+        }
+    }
+
+    if (is_tax() || is_category() || is_tag()) {
+        $term = get_queried_object();
+        if (!$term || empty($term->term_id) || empty($term->taxonomy)) {
+            return false;
+        }
+
+        if (in_array($term->taxonomy, moo_get_selected_taxonomies(), true)) {
+            return array(
+                'id' => (int) $term->term_id,
+                'type' => 'taxonomy:' . $term->taxonomy,
+            );
+        }
+    }
+
+    return false;
+}
+
 
 // ENQUEUE SCRIPTS
 add_action('wp_footer','moo_simple_hits_counter_js');
 function moo_simple_hits_counter_js() { ?>
+    <?php $tracking_context = moo_get_tracking_context();
+    if (!$tracking_context) {
+        return;
+    }
+    ?>
     <script type="text/javascript">
         var templateUrl = '<?php echo get_site_url(); ?>';
-        var post_id = '<?php echo get_the_ID(); ?>';
+        var tracked_object_id = '<?php echo esc_js($tracking_context['id']); ?>';
+        var tracked_object_type = '<?php echo esc_js($tracking_context['type']); ?>';
     </script>
     <?php  wp_enqueue_script( 'moo_simple_hits_counter_js', plugins_url( '/js/moo_simple_hits_counter_js.js', __FILE__ ), array('jquery'), '', true);
 }
@@ -118,7 +187,13 @@ function moo_simple_hits_counter_js() { ?>
 add_action('wp_ajax_moo_update_counter','moo_simple_hits_counter');
 add_action('wp_ajax_nopriv_moo_update_counter','moo_simple_hits_counter');
 function moo_simple_hits_counter(){
-    $post_id = sanitize_text_field($_GET['post_id']);
+    $post_id = isset($_GET['object_id']) ? absint($_GET['object_id']) : 0;
+    $object_type = isset($_GET['object_type']) ? sanitize_text_field(wp_unslash($_GET['object_type'])) : '';
+
+    if (!$post_id || $object_type === '') {
+        wp_die();
+    }
+
     $visitors = $views = 0;
 
     if(!isset($_COOKIE['moo_unique_visitor'])){
@@ -127,17 +202,22 @@ function moo_simple_hits_counter(){
     }
 
     $views = 1;
-    moo_update_views_visitors($post_id, $visitors, $views);
+    moo_update_views_visitors($post_id, $visitors, $views, $object_type);
 }
-function moo_update_views_visitors($post_id, $visitors, $views){
+function moo_update_views_visitors($post_id, $visitors, $views, $object_type = ''){
     global $wpdb;
     $daily_table = $wpdb->prefix.'moo_simple_hits_counter';
     $date = Date("Y-m-d");
     $time = Date("h:i:s");
-    $post_type = get_post_type($post_id);
+
+    if ($object_type === '') {
+        $object_type = get_post_type($post_id);
+    }
+
 	$daily_data = $wpdb->get_results($wpdb->prepare(
-        "SELECT * FROM $daily_table WHERE moo_post_id = %d AND moo_date = %s",
+        "SELECT * FROM $daily_table WHERE moo_post_id = %d AND moo_post_type = %s AND moo_date = %s",
         $post_id,
+        $object_type,
         $date
     ));
 	if ($daily_data) {
@@ -146,7 +226,7 @@ function moo_update_views_visitors($post_id, $visitors, $views){
         $wpdb->update(
             $daily_table,
             array('moo_visitors_count' => $new_visitors, 'moo_views_count' => $new_views),
-            array('moo_post_id' => $post_id, 'moo_date' => $date)
+            array('moo_post_id' => $post_id, 'moo_post_type' => $object_type, 'moo_date' => $date)
         );
     } else {
         $wpdb->insert(
@@ -155,7 +235,7 @@ function moo_update_views_visitors($post_id, $visitors, $views){
                 'moo_date' => $date,
                 'moo_time' => $time,
                 'moo_post_id' => $post_id,
-                'moo_post_type' => $post_type,
+                'moo_post_type' => $object_type,
                 'moo_visitors_count' => $visitors,
                 'moo_views_count' => $views
             )
@@ -166,8 +246,9 @@ function moo_update_views_visitors($post_id, $visitors, $views){
     $hourly_table = $wpdb->prefix . 'moo_simple_hits_counter_hourly';
     $current_hour = date('Y-m-d H:00:00'); // e.g., "2023-10-01 10:00:00"
     $hourly_data = $wpdb->get_results($wpdb->prepare(
-        "SELECT * FROM $hourly_table WHERE moo_post_id = %d AND moo_datetime = %s",
+        "SELECT * FROM $hourly_table WHERE moo_post_id = %d AND moo_post_type = %s AND moo_datetime = %s",
         $post_id,
+        $object_type,
         $current_hour
     ));
 
@@ -177,7 +258,7 @@ function moo_update_views_visitors($post_id, $visitors, $views){
         $wpdb->update(
             $hourly_table,
             array('moo_visitors_count' => $new_visitors, 'moo_views_count' => $new_views),
-            array('moo_post_id' => $post_id, 'moo_datetime' => $current_hour)
+            array('moo_post_id' => $post_id, 'moo_post_type' => $object_type, 'moo_datetime' => $current_hour)
         );
     } else {
         $wpdb->insert(
@@ -185,7 +266,7 @@ function moo_update_views_visitors($post_id, $visitors, $views){
             array(
                 'moo_datetime' => $current_hour,
                 'moo_post_id' => $post_id,
-                'moo_post_type' => $post_type,
+                'moo_post_type' => $object_type,
                 'moo_visitors_count' => $visitors,
                 'moo_views_count' => $views
             )
@@ -259,6 +340,7 @@ function moo_get_most_popular_post_24h() {
         SELECT moo_post_id, SUM(moo_views_count) as total_views
         FROM $table_name
         WHERE moo_datetime >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
+        AND moo_post_type NOT LIKE 'taxonomy:%'
         GROUP BY moo_post_id
         ORDER BY total_views DESC
         LIMIT 1
@@ -548,12 +630,26 @@ function moo_admin_settings_page(){
         if($_POST['reset_data']!='' && $_POST['reset_data'] == 'yes'){
             $wpdb->query("TRUNCATE $table_name");
         }
+
+        $custom_post_types = get_post_types(array('public' => true, '_builtin' => false));
+        $selected_post_types = isset($_POST['tracked_post_types']) ? (array) $_POST['tracked_post_types'] : array();
+        $selected_post_types = array_values(array_intersect(array_map('sanitize_key', $selected_post_types), $custom_post_types));
+        update_option('moo_shc_tracked_post_types', $selected_post_types);
+
+        $custom_taxonomies = get_taxonomies(array('public' => true, '_builtin' => false));
+        $selected_taxonomies = isset($_POST['tracked_taxonomies']) ? (array) $_POST['tracked_taxonomies'] : array();
+        $selected_taxonomies = array_values(array_intersect(array_map('sanitize_key', $selected_taxonomies), $custom_taxonomies));
+        update_option('moo_shc_tracked_taxonomies', $selected_taxonomies);
     }
     $data_return_visitors = moo_count_total_visitors_views('visitors');
     $data_return_views = moo_count_total_visitors_views('views');
     $moo_shc_unique_visitors_count = $data_return_visitors->total;
     $moo_shc_page_views_count = $data_return_views->total;
     $page_views_number_format_checkbox = get_option('moo_pageViews_number_format_count');
+    $selected_custom_post_types = moo_get_selected_custom_post_types();
+    $selected_taxonomies = moo_get_selected_taxonomies();
+    $custom_post_types = get_post_types(array('public' => true, '_builtin' => false), 'objects');
+    $custom_taxonomies = get_taxonomies(array('public' => true, '_builtin' => false), 'objects');
     ?>
     <div class="metabox-holder">
         <div class="postbox">
@@ -636,6 +732,53 @@ function moo_admin_settings_page(){
                             </tbody>
                         </table>
 
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="metabox-holder">
+            <div class="postbox">
+                <h3 class="hndle">
+                    <span>Tracked Content Types</span>
+                </h3>
+                <div class="inside">
+                    <div class="main">
+                        <p>Select which custom post types and taxonomies should be tracked by this plugin. Posts and pages are tracked by default.</p>
+                        <table class="form-table">
+                            <tbody>
+                            <tr>
+                                <th>Custom Post Types:</th>
+                                <td>
+                                    <?php if (!empty($custom_post_types)) { ?>
+                                        <?php foreach ($custom_post_types as $post_type_key => $post_type_obj) { ?>
+                                            <label>
+                                                <input type="checkbox" name="tracked_post_types[]" value="<?php echo esc_attr($post_type_key); ?>" <?php checked(in_array($post_type_key, $selected_custom_post_types, true)); ?>>
+                                                <?php echo esc_html($post_type_obj->labels->singular_name); ?> (<?php echo esc_html($post_type_key); ?>)
+                                            </label><br>
+                                        <?php } ?>
+                                    <?php } else { ?>
+                                        <span class="description">No public custom post types found.</span>
+                                    <?php } ?>
+                                </td>
+                            </tr>
+                            <tr>
+                                <th>Taxonomies:</th>
+                                <td>
+                                    <?php if (!empty($custom_taxonomies)) { ?>
+                                        <?php foreach ($custom_taxonomies as $taxonomy_key => $taxonomy_obj) { ?>
+                                            <label>
+                                                <input type="checkbox" name="tracked_taxonomies[]" value="<?php echo esc_attr($taxonomy_key); ?>" <?php checked(in_array($taxonomy_key, $selected_taxonomies, true)); ?>>
+                                                <?php echo esc_html($taxonomy_obj->labels->singular_name); ?> (<?php echo esc_html($taxonomy_key); ?>)
+                                            </label><br>
+                                        <?php } ?>
+                                    <?php } else { ?>
+                                        <span class="description">No public custom taxonomies found.</span>
+                                    <?php } ?>
+                                </td>
+                            </tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
